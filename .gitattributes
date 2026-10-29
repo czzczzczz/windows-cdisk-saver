@@ -1,0 +1,6 @@
+* text=auto
+
+# 批处理必须保持 CRLF + GBK 原样，禁止 git 做任何换行转换
+*.bat -text
+*.ico binary
+*.png binary

@@ -74,6 +74,92 @@ def _exe_of(pid: int) -> str:
     return ""
 
 
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD), ("cntUsage", wt.DWORD), ("th32ProcessID", wt.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", wt.DWORD), ("cntThreads", wt.DWORD),
+        ("th32ParentProcessID", wt.DWORD), ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wt.DWORD), ("szExeFile", wt.WCHAR * 260),
+    ]
+
+
+def _snapshot() -> dict:
+    """{pid: (ppid, name)}，一次遍历拿全，避免逐个查询。"""
+    TH32CS_SNAPPROCESS = 0x00000002
+    out = {}
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == -1:
+            return out
+        try:
+            e = PROCESSENTRY32W()
+            e.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = k32.Process32FirstW(snap, ctypes.byref(e))
+            while ok:
+                out[int(e.th32ProcessID)] = (int(e.th32ParentProcessID), e.szExeFile)
+                ok = k32.Process32NextW(snap, ctypes.byref(e))
+        finally:
+            k32.CloseHandle(snap)
+    except Exception:
+        pass
+    return out
+
+
+class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", wt.DWORD), ("PageFaultCount", wt.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def _mem_kb(pid: int) -> int:
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return 0
+        try:
+            psapi = ctypes.WinDLL("psapi")
+            c = PROCESS_MEMORY_COUNTERS()
+            c.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            if psapi.GetProcessMemoryInfo(h, ctypes.byref(c), c.cb):
+                return int(c.WorkingSetSize // 1024)
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        pass
+    return 0
+
+
+def _still_alive(pid: int, start_time) -> bool:
+    """PID 会被复用，必须比对创建时间才能确认是同一个进程。"""
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return False
+        try:
+            ct, et, kt, ut = wt.FILETIME(), wt.FILETIME(), wt.FILETIME(), wt.FILETIME()
+            if not k32.GetProcessTimes(h, ctypes.byref(ct), ctypes.byref(et),
+                                       ctypes.byref(kt), ctypes.byref(ut)):
+                return True     # 查不到就当作还在，宁可多报
+            return (ct.dwLowDateTime == start_time.dwLowDateTime
+                    and ct.dwHighDateTime == start_time.dwHighDateTime)
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return True
+
+
 def _sample_files(root: str, limit: int = 320, max_walk: int = 6000) -> list:
     """挑一批「最可能被占用」的文件：优先最近修改过的。"""
     rows = []
@@ -101,6 +187,23 @@ def _sample_files(root: str, limit: int = 320, max_walk: int = 6000) -> list:
             continue
     rows.sort(reverse=True)
     return [p for _, p in rows[:limit]]
+
+
+def _ancestor_chain(pid: int, snap: dict, depth: int = 3) -> str:
+    """返回「谁把它拉起来的」链条，父在前，例如 cmd.exe ← msedge.exe。"""
+    names = []
+    cur = snap.get(pid, (0, ""))[0]
+    for _ in range(depth):
+        if not cur or cur <= 4:
+            break
+        info = snap.get(cur)
+        if not info:
+            break
+        nm = info[1]
+        if nm and nm.lower() not in ("explorer.exe", "winlogon.exe", "services.exe"):
+            names.append(nm)
+        cur = info[0]
+    return " ← ".join(names) if names else "—"
 
 
 def using_processes(path: str, limit: int = 320) -> list:
@@ -141,10 +244,14 @@ def using_processes(path: str, limit: int = 320) -> list:
 
         out = []
         me = os.getpid()
+        snap = _snapshot()
         for i in range(min(count.value, n)):
             info = buf[i]
             pid = int(info.Process.dwProcessId)
             if pid == me or pid <= 4:
+                continue
+            # 进程可能已经退出（Restart Manager 拿到的是查询那一刻的快照）
+            if not _still_alive(pid, info.Process.ProcessStartTime):
                 continue
             exe = _exe_of(pid)
             name = os.path.basename(exe) if exe else (info.strAppName or f"PID {pid}")
@@ -154,6 +261,8 @@ def using_processes(path: str, limit: int = 320) -> list:
                 "exe": exe,
                 "app": info.strAppName,
                 "type": RM_APP_TYPE.get(int(info.ApplicationType), "未知"),
+                "parent": _ancestor_chain(pid, snap),
+                "mem_kb": _mem_kb(pid),
             })
         # 去重
         seen, uniq = set(), []

@@ -35,10 +35,15 @@ def show_unlock(parent, app, paths, on_retry=None):
     body = card(win, padx=0, pady=0)
     body.pack(fill="both", expand=True, padx=pad, pady=(10, 8))
     cols = [("chk", ""), ("name", "程序"), ("pid", "PID"),
-            ("type", "类型"), ("exe", "路径")]
-    frame, tv = tree(body.inner, cols, [34, 180, 70, 80, 380], height=10,
-                     stretch=[False, False, False, False, True])
+            ("parent", "谁拉起来的"), ("mem", "内存"), ("exe", "路径")]
+    frame, tv = tree(body.inner, cols, [34, 160, 62, 180, 68, 300], height=10,
+                     stretch=[False, False, False, False, False, True])
     frame.pack(fill="both", expand=True)
+
+    tip = label(win, "「谁拉起来的」从右往左看：关掉最右边那个程序，它就不会再被重启。"
+                     "这些都是无窗口的后台进程，任务管理器需在「详细信息」里按 PID 查找。",
+                F_SMALL, SUB, BG, justify="left", wraplength=700)
+    tip.pack(anchor="w", padx=pad, pady=(0, 2))
 
     status = label(win, "正在查找占用程序 …", F_SMALL, MUTED, BG)
     status.pack(anchor="w", padx=pad)
@@ -80,9 +85,12 @@ def show_unlock(parent, app, paths, on_retry=None):
             return
         for i, p in enumerate(procs):
             prot = is_protected(p["name"])
+            mem = p.get("mem_kb", 0)
             iid = tv.insert("", "end", values=(
                 BOX_OFF if prot else BOX_ON, p["name"], p["pid"],
-                p["type"], p["exe"] or p["app"] or "—"),
+                p.get("parent", "—"),
+                f"{mem:,} KB" if mem else "—",
+                p["exe"] or p["app"] or "—"),
                 tags=("warn",) if prot else (("even",) if i % 2 else ()))
             state["rows"][iid] = p
             state["checked"][iid] = not prot
@@ -116,12 +124,15 @@ def show_unlock(parent, app, paths, on_retry=None):
                 f"即将强制结束 {len(pids)} 个进程：\n{names}\n\n"
                 "未保存的数据会丢失。确定继续？", parent=win):
             return
+        # 记下被结束的可执行文件路径，用于判断是否被重新拉起
+        killed = {state["rows"][i]["exe"].lower() for i, v in state["checked"].items()
+                  if v and i in state["rows"] and state["rows"][i].get("exe")}
         btn_kill.configure(state="disabled")
         status.configure(text="正在结束进程 …", fg=MUTED)
         ok, bad = kill_processes(pids)
-        win.after(1200, lambda: finish(ok, bad))
+        win.after(1500, lambda: finish(ok, bad, killed))
 
-    def finish(ok, bad):
+    def finish(ok, bad, killed=None):
         win.grab_release()
         win.destroy()
         if bad:
@@ -129,6 +140,24 @@ def show_unlock(parent, app, paths, on_retry=None):
                 "部分进程未能结束",
                 f"成功 {ok} 个，失败 {len(bad)} 个。\n"
                 "失败通常是权限不足（需要管理员）或进程受系统保护。")
+
+        # 有些进程被父进程守护，杀掉会立刻重启——这种情况结束进程治不了根
+        killed = killed or set()
+        again = []
+        try:
+            again = [p for p in work() if (p.get("exe") or "").lower() in killed]
+        except Exception:
+            again = []
+        if again:
+            names = "、".join(sorted({p["name"] for p in again}))
+            chain = next((p.get("parent") for p in again
+                          if p.get("parent") not in (None, "—")), "")
+            hint = f"\n它是被「{chain}」拉起来的。" if chain else ""
+            messagebox.showwarning(
+                "进程又被启动了",
+                f"{names} 刚刚又重新出现了，说明有父进程在守护它。{hint}\n\n"
+                "结束进程治不了根，请直接关闭那个程序（看「谁拉起来的」列），再回来重试迁移。")
+            return
         if on_retry:
             on_retry()
 

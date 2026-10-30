@@ -438,7 +438,8 @@ class MigratePage(tk.Frame):
             return
         self.migrate_targets([r["t"] for r in picked])
 
-    def migrate_targets(self, targets):
+    def migrate_targets(self, targets, quiet=False):
+        """quiet=True 表示这是「关闭占用」后的自动重试，不再弹一次确认框。"""
         if self.busy:
             messagebox.showinfo("提示", "当前有任务在执行")
             return
@@ -455,15 +456,16 @@ class MigratePage(tk.Frame):
                 return
         self._save_dest()
 
-        names = "、".join(t.name for t in targets[:8]) + ("…" if len(targets) > 8 else "")
-        tip = "" if is_admin() else "\n（当前为普通权限，位于 ProgramData / Windows 下的目录可能失败）"
-        if not messagebox.askyesno(
-                "确认迁移",
-                f"即将迁移 {len(targets)} 项：\n{names}\n\n"
-                f"落点：{dest}\n\n"
-                "流程：复制 → 校验 → 建立目录联接 → 释放 C 盘原件。\n"
-                "过程中请关闭对应软件，避免文件被占用。" + tip):
-            return
+        if not quiet:
+            names = "、".join(t.name for t in targets[:8]) + ("…" if len(targets) > 8 else "")
+            tip = "" if is_admin() else "\n（当前为普通权限，位于 ProgramData / Windows 下的目录可能失败）"
+            if not messagebox.askyesno(
+                    "确认迁移",
+                    f"即将迁移 {len(targets)} 项：\n{names}\n\n"
+                    f"落点：{dest}\n\n"
+                    "流程：复制 → 校验 → 建立目录联接 → 释放 C 盘原件。\n"
+                    "过程中请关闭对应软件，避免文件被占用。" + tip):
+                return
 
         self.busy = True
         self.cancel.clear()
@@ -529,8 +531,17 @@ class MigratePage(tk.Frame):
             self.refresh()
             self.app.on_targets_updated()
 
-            if locked:
-                self.after(400, lambda: self._offer_unlock(locked))
+        if locked:
+            self.after(400, lambda: self._offer_unlock(locked))
+        elif ok_cnt:
+            # 成功也要给个明确反馈，否则用户不知道到底成没成
+            freed_txt = human(freed)
+            self._log(f"===== 全部成功：{ok_cnt} 项，释放 {freed_txt} =====")
+            messagebox.showinfo(
+                "迁移完成",
+                f"成功迁移 {ok_cnt} 项，C 盘释放约 {freed_txt}。\n\n"
+                "原路径已变成指向新位置的目录联接，程序照常使用。\n"
+                "随时可在「迁移记录」里一键还原。")
 
         run_async(self.app.post, work, done,
                   on_error=lambda e: (self._log(f"异常：{e}"), self._reset()))
@@ -543,19 +554,32 @@ class MigratePage(tk.Frame):
                 f"以下 {len(targets)} 项因为文件被占用而没能迁移：\n{names}\n\n"
                 "要不要查找并关闭占用这些目录的程序？\n"
                 "（关闭前请先保存工作，未保存的数据会丢失）"):
+            self._log("已跳过「关闭占用程序」，迁移未完成")
+            self._set_status("迁移未完成：文件被占用，可稍后关闭相关程序再试")
             return
         paths = []
         for t in targets:
             paths.extend(t.expand())
         show_unlock(self, self.app, paths,
-                    on_retry=lambda: self._retry_when_idle(targets))
+                    on_retry=lambda note="": self._retry_when_idle(targets, 0, note))
 
-    def _retry_when_idle(self, targets, tries=0):
+    def _retry_when_idle(self, targets, tries=0, note=""):
         """等扫描/刷新结束再重试，避免撞上 busy 直接退出。"""
+        if note:
+            self._log(note)
+            self._set_status(f"{note}，正在准备重试 …")
         if self.busy and tries < 60:
-            self.after(500, lambda: self._retry_when_idle(targets, tries + 1))
+            self.after(500, lambda: self._retry_when_idle(targets, tries + 1, ""))
             return
-        self.migrate_targets(targets)
+        if self.busy:
+            self._log("===== 重试中止：后台任务一直没结束 =====")
+            self._set_status("重试中止：后台任务未结束，请稍后手动点「迁移勾选项」")
+            messagebox.showwarning(
+                "暂时无法重试",
+                "后台还有一个任务没结束（扫描或迁移中），等它完成后请手动点"
+                "「迁移勾选项」再试一次。")
+            return
+        self.migrate_targets(targets, quiet=bool(note))
 
     def _reset(self):
         self.busy = False

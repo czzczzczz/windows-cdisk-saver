@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from types import SimpleNamespace
 
@@ -230,6 +231,179 @@ def main():
             w.grab_release()
             w.destroy()
         check("unlock 对话框 打开/关闭", unlock_dlg)
+
+        print("\n[4d] 「结束进程」全链路：每个分支都必须有可见反馈")
+        from cdisk.pages import unlock as UU
+
+        _info, _warn = messagebox.showinfo, messagebox.showwarning
+        VICTIM = [{"pid": 90001, "name": "host.exe", "exe": r"C:\x\host.exe",
+                   "app": "host", "parent": "—", "mem_kb": 1024, "type": "未知"},
+                  {"pid": 90002, "name": "child.exe", "exe": r"C:\x\child.exe",
+                   "app": "child", "parent": "host.exe", "mem_kb": 2048, "type": "未知"}]
+
+        def case(kill_ret, rescan, answer=True, result=False):
+            """跑一个场景：打开对话框 → 注入进程 → 点「结束选中并重试」→ 等结束。
+
+            answer 回答「确认结束进程」，result 回答结果框里的「要重试吗」。
+            返回 (弹过的提示标题, on_retry 收到的说明, 结束时的状态栏文字)。
+            """
+            popups = []
+            got = {"retry": [], "status": ""}
+            ok, bad = kill_ret
+            o_use, o_kill = UU.using_processes, UU.kill_processes
+
+            def fake_yesno(title="", *a, **k):
+                # 「确认结束进程」用 answer，其余（结果反馈框）用 result
+                hit = answer if title == "确认结束进程" else result
+                if title != "确认结束进程":
+                    popups.append(title)      # 结果框本身就是反馈
+                return hit
+            messagebox.askyesno = fake_yesno
+            messagebox.showwarning = lambda t, m="", **k: popups.append(t) or "ok"
+            messagebox.showinfo = lambda t, m="", **k: popups.append(t) or "ok"
+
+            def fake_use(p, limit=320):
+                # 第一次（对话框打开）给占用列表；之后的重扫给 rescan
+                return list(VICTIM) if not fake_use.called else list(rescan)
+            fake_use.called = False
+
+            def fake_kill(pids):
+                fake_use.called = True
+                return ok, bad
+
+            UU.using_processes = fake_use
+            UU.kill_processes = fake_kill
+            w = None
+            try:
+                w = show_unlock(root, app, [os.path.join(HOME, "AppData", "Local")],
+                                lambda note="": got["retry"].append(note))
+                dbg = w._dbg
+                dbg["fill"](VICTIM)          # 注入，走真实渲染与勾选逻辑
+                root.update()
+                assert dbg["state"]["rows"], "注入后表格仍为空"
+                dbg["kill"]()
+
+                deadline = time.time() + 2.2
+                fin = {"v": False}
+
+                def stop():
+                    fin["v"] = True
+
+                def poll():
+                    # 固定留 2.2s 观察窗口：弹窗在 done() 里排队，
+                    # 早退会读到「还没弹」的中间态
+                    if time.time() > deadline:
+                        stop()
+                        return
+                    root.after(40, poll)
+                t0 = time.time()
+                root.after(40, poll)
+                root.after(2600, stop)
+                # 保险：任何情况下 4 秒后都要退出这一轮（grab 被抢占时 mainloop 会饿死）
+                root.after(4000, lambda: root.quit())
+
+                # 必须走真正的 mainloop：在 Python 栈上用 update() 死转，
+                # done() 里排队的提示框永远等不到执行窗口，测试就会误判成
+                # 「什么都没弹」——而这恰恰是用户报的那个 bug 的假象。
+                root.mainloop()
+                # 等 done() 之后的收尾（关窗 → 后续回调）真正跑完
+                try:
+                    got["status"] = dbg["status"].cget("text")
+                except tk.TclError:
+                    pass
+
+            finally:
+                UU.using_processes, UU.kill_processes = o_use, o_kill
+                # 清干净：残留的 grab 会让下一个场景的事件循环卡死
+                for tw in list(root.winfo_children()):
+                    if isinstance(tw, tk.Toplevel) and tw.title() == "关闭占用程序":
+                        try:
+                            tw.grab_release()
+                            tw.destroy()
+                        except tk.TclError:
+                            pass
+                try:
+                    root.grab_release()
+                except tk.TclError:
+                    pass
+                root.update()
+            return popups, got["retry"], got["status"]
+
+        def expect(cond, msg):
+            if not cond:
+                raise AssertionError(msg)
+
+        def case_ok():
+            tips, retry, st = case((2, []), [])       # 全成功、占用已解除
+            expect(retry, "成功结束时必须调用重试，否则用户看不到任何结果")
+            expect("结束" in retry[0], f"重试说明里要写清做了什么，实际：{retry[0]}")
+            return tips, retry, st
+
+        def case_all_fail():
+            tips, retry, st = case((0, [(90001, "拒绝访问"), (90002, "拒绝访问")]), [])
+            expect("进程没能结束" in tips, f"全部失败必须弹提示，实际 {tips}")
+            expect("占用程序仍在运行" in st, f"状态栏也要说明，实际 {st!r}")
+
+        def case_part_fail():
+            tips, retry, st = case((1, [(90002, "拒绝访问")]), VICTIM)
+            expect("部分进程没能结束" in tips, f"部分失败要弹提示，实际 {tips}")
+
+        def case_reborn():
+            tips, retry, st = case((2, []), VICTIM)   # 杀完占用还在、还是同一程序
+            expect("进程又被启动了" in tips, f"被杀后又出现要明确告知，实际 {tips}")
+            expect("已暂停" in st, f"答否后状态栏要说明，实际 {st!r}")
+
+        def case_still_locked():
+            other = [{"pid": 91001, "name": "other.exe", "exe": r"C:\x\other.exe",
+                      "app": "other", "parent": "—", "mem_kb": 1, "type": "未知"}]
+            tips, retry, st = case((2, []), other)     # 杀干净了，但还有别的程序占用
+            expect("目录仍被占用" in tips, f"仍有其它占用要说明，实际 {tips}")
+
+        def case_cancel_confirm():
+            tips, retry, st = case((2, []), [], answer=False)
+            expect(not retry and not tips, "用户在确认框点取消时不应有任何动作")
+            expect("取消" in st, f"取消后状态栏要说明，实际 {st!r}")
+
+        def case_retry_on_yes():
+            # 全部失败后点「是」→ 必须真的走重试，并把原因带出去
+            tips, retry, st = case((0, [(90001, "拒绝访问")]), [], result=True)
+            expect(retry and "没能结束" in retry[0],
+                   f"同意重试时应把失败原因带给调用方，实际 {retry}")
+
+        check("结束进程：全部成功 → 有说明并自动重试", case_ok)
+        check("结束进程：全部失败 → 弹「进程没能结束」", case_all_fail)
+        check("结束进程：部分失败 → 弹提示", case_part_fail)
+        check("结束进程：被杀后又出现 → 弹「进程又被启动了」", case_reborn)
+        check("结束进程：占用仍在（别的程序）→ 弹「目录仍被占用」", case_still_locked)
+        check("结束进程：确认框点取消 → 状态栏说明", case_cancel_confirm)
+        check("结束进程：失败后同意重试 → 带上原因", case_retry_on_yes)
+
+        # 自己/自己的祖先进程绝不能进 taskkill —— 否则点了按钮界面直接消失
+        from cdisk.handles import _pids_to_keep
+        check("kill 黑名单包含自身进程",
+              lambda: expect(__import__("os").getpid() in _pids_to_keep(),
+                             "自身 PID 必须排除"))
+        check("kill 黑名单包含父进程",
+              lambda: expect(len(_pids_to_keep()) >= 2,
+                             "至少要排除自己和父进程"))
+
+        def kill_self_guard():
+            real = UU.kill_processes
+            called = []
+            import cdisk.handles as HH
+            orig_run = HH.run if hasattr(HH, "run") else None
+            import cdisk.util as _u
+            saved = _u.run
+            _u.run = lambda *a, **k: called.append(a) or (0, "", "")
+            try:
+                ok, bad = real([os.getpid()])
+            finally:
+                _u.run = saved
+            expect(ok == 0 and bad, f"结束自身必须被拒绝，实际 ok={ok} bad={bad}")
+            expect(not called, f"不应真的调用 taskkill，实际 {called}")
+        check("kill_processes 拒绝结束自身", kill_self_guard)
+
+        messagebox.showinfo, messagebox.showwarning = _info, _warn
 
         print("\n[5] 系统清理页")
         cp = app.pages["clean_page"] if "clean_page" in app.pages else app.pages["clean"]

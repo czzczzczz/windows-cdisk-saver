@@ -280,16 +280,53 @@ def using_processes(path: str, limit: int = 320) -> list:
             pass
 
 
+TASKKILL_DENIED = 5
+
+
+def _pids_to_keep():
+    """绝不能结束的进程：自己和所有祖先（cmd.exe / 父 shell 一杀，本程序跟着崩）。"""
+    keep = {os.getpid()}
+    try:
+        snap = _snapshot()
+        cur = os.getpid()
+        for _ in range(8):
+            ppid = snap.get(cur, (0, ""))[0]
+            if not ppid or ppid <= 4 or ppid in keep:
+                break
+            keep.add(ppid)
+            cur = ppid
+    except Exception:
+        pass
+    return keep
+
+
 def kill_processes(pids) -> tuple:
-    """结束进程，返回 (成功数, 失败列表)。"""
+    """结束进程，返回 (成功数, [(pid, 原因)])。
+
+    用 taskkill /F /T 结束整个进程树：父进程死了子进程还活着，占用照样不释放。
+    另外会把自己和自己的祖先进程剔除——否则结束 cmd.exe 会把本程序一起带走，
+    表现就是「点了按钮，界面直接消失，什么提示都没有」。
+    """
     from .util import run
+    keep = _pids_to_keep()
     ok, bad = 0, []
     for pid in pids:
-        rc, _, err = run(["taskkill", "/F", "/PID", str(pid)])
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if pid in keep:
+            bad.append((pid, "是本程序或它的父进程，已跳过"))
+            continue
+        rc, out, err = run(["taskkill", "/F", "/T", "/PID", str(pid)])
         if rc == 0:
             ok += 1
         else:
-            bad.append((pid, (err or "").strip()[:80]))
+            why = ((err or "") + (out or "")).strip().splitlines()
+            text = why[0].strip() if why else ""
+            if not text:
+                text = f"taskkill 返回 {rc}"
+            bad.append((pid, text[:100]))
     return ok, bad
 
 
@@ -299,6 +336,9 @@ PROTECTED = {
     "services.exe", "lsass.exe", "smss.exe", "explorer.exe", "dwm.exe",
     "svchost.exe", "fontdrvhost.exe", "ctfmon.exe", "sihost.exe",
     "taskhostw.exe", "runtimebroker.exe", "searchhost.exe", "startmenuexperiencehost.exe",
+    # 终端/解释器：结束它们会把本程序或它所在的会话一起干掉
+    "cmd.exe", "conhost.exe", "windowsterminal.exe", "wt.exe",
+    "openconsole.exe", "python.exe", "pythonw.exe", "explorer.exe",
 }
 
 

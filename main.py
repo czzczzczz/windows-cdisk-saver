@@ -259,12 +259,12 @@ class App:
         self.open_page("migrate")
         self.pages["migrate"].migrate_targets([row["t"]])
 
-    def custom_migrate(self, path, size=0):
+    def custom_migrate(self, path, size=0, quiet=False):
         if not os.path.isdir(path):
             messagebox.showerror("错误", "目录不存在")
             return
         dst = os.path.join(self.svc.dest_root, "Custom", os.path.basename(path.rstrip("\\")))
-        if not messagebox.askyesno(
+        if not quiet and not messagebox.askyesno(
                 "迁移自定义目录",
                 f"源目录：{path}\n目标目录：{dst}\n\n"
                 "迁移后原路径会变成指向新位置的目录联接，程序照常访问。\n是否继续？"):
@@ -295,7 +295,7 @@ class App:
                             f"{msg}\n\n要不要查找并关闭占用它的程序？\n"
                             "（关闭前请先保存工作，未保存的数据会丢失）"):
                         show_unlock(self.root, self, [path],
-                                    on_retry=lambda: self.custom_migrate(path))
+                                    on_retry=lambda note="": self.custom_migrate(path))
                 else:
                     messagebox.showerror("迁移失败", msg)
 

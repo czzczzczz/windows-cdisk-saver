@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 from cdisk import ui
-from cdisk.migrate import Job, migrate_job
+from cdisk.migrate import Job, is_lock_error, migrate_job
 from cdisk.pages.analyze import AnalyzePage
 from cdisk.pages.clean_page import CleanPage
 from cdisk.pages.history import HistoryPage
@@ -289,7 +289,7 @@ class App:
                 messagebox.showinfo("完成", msg)
                 self.refresh_targets()
             else:
-                if "被占用" in msg:
+                if is_lock_error(msg):
                     if messagebox.askyesno(
                             "文件被占用",
                             f"{msg}\n\n要不要查找并关闭占用它的程序？\n"

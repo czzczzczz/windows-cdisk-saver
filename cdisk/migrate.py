@@ -69,9 +69,22 @@ def _robocopy(src: str, dst: str, total: int, progress=None, cancel=None):
     rc = p.returncode
     if progress:
         progress(1.0)
+    if rc >= 16:
+        return False, (f"复制失败（robocopy code={rc}）："
+                       "目标路径不可写，或目标磁盘已满。")
     if rc >= 8:
-        return False, f"robocopy 失败 (code={rc})"
+        # 8~15：有文件没能复制，绝大多数情况是文件正被程序占用，其次是权限不足
+        return False, (f"有文件没能复制（robocopy code={rc}）："
+                       "文件正被程序占用，或当前账户没有读取权限。")
     return True, ""
+
+
+# 判定「是不是占用/权限导致的失败」，用于触发一键关闭占用
+_LOCK_MARKERS = ("被占用", "没能复制", "拒绝访问", "WinError 5")
+
+
+def is_lock_error(msg: str) -> bool:
+    return any(m in (msg or "") for m in _LOCK_MARKERS)
 
 
 def _delete_tree(path: str, total_files: int = 0, progress=None):
@@ -137,6 +150,15 @@ def migrate_job(job: Job, progress=None, stage=None, cancel=None,
     if job.files == 0 and job.bytes == 0:
         job.scan()
     total = job.bytes
+
+    # 0. 空间预检：目标盘不够就直接说清楚，别复制到一半才失败
+    if total > 0:
+        avail = free_bytes(dst)
+        if avail < total * 1.05:
+            return (False,
+                    f"目标盘空间不足：需要约 {human(total)}，"
+                    f"{drive_of(dst)} 只剩 {human(avail)}。请换一个落点或先清理目标盘。",
+                    None)
 
     # 1. 复制
     st(f"正在复制到 {dst} …")

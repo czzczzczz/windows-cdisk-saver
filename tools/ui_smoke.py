@@ -198,7 +198,21 @@ def main():
 
         print("\n[4c] 占用检测与「关闭占用」对话框")
         from cdisk.handles import is_protected, using_processes
+        from cdisk.migrate import is_lock_error
         from cdisk.pages.unlock import show_unlock
+
+        check("robocopy code=9 判为占用失败",
+              lambda: expect(is_lock_error("有文件没能复制（robocopy code=9）：文件正被程序占用"),
+                             "code=9 应触发关闭占用"))
+        check("WinError 5 判为占用失败",
+              lambda: expect(is_lock_error("源目录被占用或权限不足（WinError 5）"),
+                             "WinError 5 应触发关闭占用"))
+        check("磁盘已满不判为占用",
+              lambda: expect(not is_lock_error("复制失败（robocopy code=16）：目标磁盘已满"),
+                             "磁盘满不该弹关闭占用"))
+        check("空间预检提示不判为占用",
+              lambda: expect(not is_lock_error("目标盘空间不足：需要约 3 GB"),
+                             "空间不足不该弹关闭占用"))
 
         check("using_processes 对不存在的路径返回空",
               lambda: expect(using_processes(os.path.join(HOME, "_no_such_dir_xyz")) == [],

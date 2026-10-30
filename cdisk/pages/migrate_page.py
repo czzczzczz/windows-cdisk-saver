@@ -7,7 +7,8 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from ..migrate import build_jobs, find_record_by_src, migrate_job, rollback
+from ..migrate import (build_jobs, find_record_by_src, is_lock_error,
+                       migrate_job, rollback)
 from ..ui import (ACCENT, BG, BORDER, CARD, GREEN, MUTED, ORANGE, RED, SUB, TEXT,
                   button, card, entry, label, run_async, tree, F_BODY, F_H1, F_SMALL,
                   F_TITLE)
@@ -508,7 +509,7 @@ class MigratePage(tk.Frame):
                         self.app.post(lambda m=msg: self._log(f"  ✔ {m}"))
                     else:
                         fail_cnt += 1
-                        if "被占用" in msg:
+                        if is_lock_error(msg):
                             locked.append(t)
                         self.app.post(lambda m=msg: self._log(f"  ✘ {m}"))
             return ok_cnt, fail_cnt, freed, locked

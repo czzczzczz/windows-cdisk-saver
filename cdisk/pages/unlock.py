@@ -15,7 +15,8 @@ import threading
 import time
 import tkinter as tk
 
-from ..handles import is_protected, kill_processes, using_processes
+from ..handles import (is_protected, kill_processes, locked_files,
+                       using_processes)
 from ..ui import (ACCENT, BG, BORDER, CARD, GREEN, MUTED, ORANGE, RED, SUB, TEXT,
                   button, card, label, run_async, tree, F_BODY, F_H1, F_SMALL, F_TITLE)
 
@@ -24,8 +25,13 @@ NOTE_RETRY = "已跳过结束进程，直接重试迁移"
 NOTE_KILLED = "已结束占用进程，重新开始迁移"
 
 
-def show_unlock(parent, app, paths, on_retry=None):
-    """弹窗列出占用进程。paths 可以是目录列表。"""
+def show_unlock(parent, app, paths, on_retry=None, on_partial=None):
+    """弹窗列出占用进程。paths 可以是目录列表。
+
+    on_partial 存在时，多给一个「只迁移没被占用的部分」出口——
+    当占用者是正在运行、不能关的程序（比如用户自己正在用的软件），
+    把没被锁的子目录单独迁走才是真正能腾出空间的做法。
+    """
     paths = [p for p in (paths or []) if p]
     win = tk.Toplevel(parent)
     win.title("关闭占用程序")
@@ -102,6 +108,9 @@ def show_unlock(parent, app, paths, on_retry=None):
             pass
 
     def say(text, fg=MUTED):
+        # 用户一旦操作过，后台异步检测的结果就不该再覆盖状态栏
+        state["acted"] = True
+
         def do():
             status.configure(text=text, fg=fg)
         safe(do)()
@@ -130,16 +139,25 @@ def show_unlock(parent, app, paths, on_retry=None):
 
     tv.bind("<Button-1>", on_click)
 
-    def fill(procs):
+    def fill(procs, locked=0):
         if not alive():
             return
         tv.delete(*tv.get_children())
         state["rows"].clear()
         state["checked"].clear()
+        # 用户已经点过按钮，表格照常更新，但不要覆盖他已经看到的提示
+        quiet = bool(state.get("acted"))
         if not procs:
-            status.configure(
-                text="没有找到占用进程。可能是系统缓存占用，或需要管理员权限；"
-                     "也可能程序刚退出，直接点「只重试」即可。", fg=ORANGE)
+            if not quiet:
+                if locked:
+                    status.configure(
+                        text=f"检测到 {locked} 个文件被独占锁定，但定位不到具体进程"
+                             "（常见于杀毒软件、系统索引、或受保护的系统服务）。",
+                        fg=ORANGE)
+                else:
+                    status.configure(
+                        text="没有检测到独占锁定的文件。迁移失败的原因可能不是占用，"
+                             "可能是路径过长、权限不足或磁盘问题。", fg=ORANGE)
             btn_kill.configure(text="结束选中并重试 (0)", state="disabled")
             return
         for i, p in enumerate(procs):
@@ -155,19 +173,44 @@ def show_unlock(parent, app, paths, on_retry=None):
             state["checked"][iid] = not prot
         tv.tag_configure("warn", foreground=RED)
         n = sum(1 for v in state["checked"].values() if v)
-        status.configure(text=f"找到 {len(procs)} 个占用进程，已勾选 {n} 个。"
-                              f"受保护的系统进程已置灰、无法勾选。", fg=MUTED)
+        if not quiet:
+            in_use = [p for p in procs if p.get("has_window")]
+            if in_use:
+                who = "、".join(sorted({p["name"] for p in in_use}))[:40]
+                status.configure(
+                    text=f"找到 {len(procs)} 个占用进程，其中「{who}」有打开的窗口，"
+                         f"说明你正在使用它。结束它会把该程序直接关掉，"
+                         f"建议改用「只迁移没被占用的部分」。", fg=ORANGE)
+            else:
+                status.configure(text=f"找到 {len(procs)} 个占用进程，已勾选 {n} 个。"
+                                      f"受保护的系统进程已置灰、无法勾选。", fg=MUTED)
         refresh_total()
 
     def work():
+        """返回 (进程列表, 被独占锁定的文件数)。
+
+        先用独占打开找出真正被锁的文件，再交给 Restart Manager 定位。
+        只看 RM 的随机采样会漏——尤其目录里有几万个文件的子目录时，
+        根目录上的数据库、lockfile 反而采不到。
+        """
         seen, out = set(), []
+        locked_total = 0
         for p in paths:
-            for proc in using_processes(p):
+            try:
+                lk = locked_files(p)
+            except Exception:
+                lk = []
+            locked_total += len(lk)
+            try:
+                procs = using_processes(p, extra_files=lk)
+            except Exception:
+                procs = []
+            for proc in procs:
                 if proc["pid"] in seen:
                     continue
                 seen.add(proc["pid"])
                 out.append(proc)
-        return out
+        return out, locked_total
 
     def checked_rows():
         return [state["rows"][i] for i, v in state["checked"].items()
@@ -317,7 +360,7 @@ def show_unlock(parent, app, paths, on_retry=None):
             ok, bad = kill_processes(pids)
             time.sleep(0.6)                 # 给 Windows 一点时间回收句柄
             try:
-                left = work()               # 重新扫一遍：占用还在不在
+                left, _locked = work()      # 重新扫一遍：占用还在不在
             except Exception:
                 return ok, bad, None, [], []
             left = left or []
@@ -346,11 +389,20 @@ def show_unlock(parent, app, paths, on_retry=None):
         if on_retry:
             on_retry(note)
 
+    def do_partial():
+        close()
+        if on_partial:
+            on_partial()
+
     btn_kill = button(btns, "结束选中并重试 (0)", do_kill)
     btn_kill.pack(side="right")
     button(btns, "只重试", do_retry, "soft").pack(side="right", padx=8)
+    if on_partial:
+        button(btns, "只迁移没被占用的部分", do_partial, "soft").pack(
+            side="right", padx=8)
     button(btns, "取消", close, "ghost").pack(side="right")
     win._dbg.update({"kill": do_kill, "retry": do_retry, "status": status,
+                     "partial": do_partial,
                      "btn_kill": btn_kill})
 
     def find_failed(exc):
@@ -358,5 +410,5 @@ def show_unlock(parent, app, paths, on_retry=None):
             status.configure(text=f"查找占用进程失败：{exc}", fg=RED)
             btn_kill.configure(state="normal")
 
-    run_async(app.post, work, fill, on_error=find_failed)
+    run_async(app.post, work, lambda r: fill(*r), on_error=find_failed)
     return win

@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from ..migrate import (build_jobs, find_record_by_src, is_lock_error,
-                       migrate_job, rollback)
+                       list_subdirs, migrate_job, partial_migrate, rollback)
 from ..ui import (ACCENT, BG, BORDER, CARD, GREEN, MUTED, ORANGE, RED, SUB, TEXT,
                   button, card, entry, label, run_async, tree, F_BODY, F_H1, F_SMALL,
                   F_TITLE)
@@ -547,21 +547,141 @@ class MigratePage(tk.Frame):
                   on_error=lambda e: (self._log(f"异常：{e}"), self._reset()))
 
     def _offer_unlock(self, targets):
-        """迁移因占用失败时，提供一键关闭占用程序并重试。"""
+        """迁移因占用失败时，提供两条出路：关掉占用程序，或只迁没被占用的部分。"""
         names = "、".join(t.name for t in targets[:5])
-        if not messagebox.askyesno(
+        paths = []
+        for t in targets:
+            paths.extend(t.expand())
+
+        if messagebox.askyesno(
                 "有程序正在占用文件",
                 f"以下 {len(targets)} 项因为文件被占用而没能迁移：\n{names}\n\n"
                 "要不要查找并关闭占用这些目录的程序？\n"
                 "（关闭前请先保存工作，未保存的数据会丢失）"):
-            self._log("已跳过「关闭占用程序」，迁移未完成")
-            self._set_status("迁移未完成：文件被占用，可稍后关闭相关程序再试")
+            show_unlock(self, self.app, paths,
+                        on_retry=lambda note="": self._retry_when_idle(targets, 0, note),
+                        on_partial=lambda: self.partial_migrate(paths))
             return
-        paths = []
-        for t in targets:
-            paths.extend(t.expand())
-        show_unlock(self, self.app, paths,
-                    on_retry=lambda note="": self._retry_when_idle(targets, 0, note))
+
+        # 不想关程序？那就把没被占用的子目录单独迁走——一样能腾出空间
+        if messagebox.askyesno(
+                "改为部分迁移？",
+                "不关闭程序也可以：把每个目录下「没被占用」的子目录单独迁走。\n\n"
+                "被正在运行的程序锁住的少数文件会自动跳过，"
+                "其余部分照常搬到目标盘，原路径变成目录联接。\n\n"
+                "要试试部分迁移吗？"):
+            self.partial_migrate(paths)
+            return
+
+        self._log("已跳过「关闭占用程序」，迁移未完成")
+        self._set_status("迁移未完成：文件被占用，可稍后关闭相关程序再试")
+
+    # ------------------------------------------------------------------ 部分迁移
+    def partial_migrate(self, roots):
+        """整目录被占用时的出路：把没被锁的一级子目录逐个迁走。
+
+        正在运行的程序会锁住数据库和缓存，但同目录下的 traces / logs /
+        plugins 往往完全没被锁。把这些单独迁走一样能腾出空间，
+        而且不需要关掉任何程序。
+        """
+        if self.busy:
+            messagebox.showinfo("提示", "当前有任务在执行")
+            return
+        roots = [r for r in roots if os.path.isdir(r)]
+        if not roots:
+            messagebox.showinfo("提示", "没有可处理的目录")
+            return
+        dest = self.var_dest.get().strip()
+        if not dest:
+            messagebox.showerror("错误", "请先设置迁移落点")
+            return
+        self._save_dest()
+
+        plan = []
+        for r in roots:
+            for sub in list_subdirs(r):
+                plan.append((r, sub))
+        if not plan:
+            messagebox.showinfo(
+                "没有可拆分的子目录",
+                "这个目录下面没有可以单独迁移的子目录。\n"
+                "请关闭占用它的程序后重试完整迁移。")
+            return
+
+        if not messagebox.askyesno(
+                "部分迁移",
+                f"将把这个目录下的 {len(plan)} 个子目录逐个尝试迁移，"
+                "被占用的会自动跳过。\n\n"
+                f"落点：{dest}\n\n"
+                "每个子目录迁移后原路径都会变成目录联接，程序照常访问。\n"
+                "这个方式不需要关闭任何程序。是否继续？"):
+            return
+
+        self.busy = True
+        self.cancel.clear()
+        self.btn_go.configure(state="disabled")
+        self.btn_refresh.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
+        self.pb.configure(mode="determinate", value=0)
+        self._log("===== 开始部分迁移（逐个一级子目录）=====")
+
+        def stage(msg):
+            self.app.post(lambda: self._set_status(msg))
+
+        def prog(p):
+            self.app.post(lambda: self.pb.configure(value=max(0, min(100, p * 100))))
+
+        def work():
+            ok_n = fail_n = 0
+            freed = 0
+            fails = []
+
+            def on_item(i, total, name, st):
+                if st == "start":
+                    self.app.post(lambda: self._log(f"({i}/{total}) {name} …"))
+                elif st == "ok":
+                    self.app.post(lambda: self._log(f"  ✔ {name}"))
+                elif st == "fail":
+                    self.app.post(lambda: self._log(f"  ✘ {name} 被占用，已跳过"))
+
+            for root in roots:
+                if self.cancel.is_set():
+                    break
+                o, f, b = partial_migrate(
+                    root, dest, progress=prog, stage=stage, cancel=self.cancel,
+                    keep_backup=self.var_backup.get(), on_item=on_item)
+                ok_n += o
+                freed += b
+                fail_n += len(f)
+                fails.extend(f)
+            return ok_n, fail_n, freed, fails
+
+        def done(res):
+            ok_n, fail_n, freed, fails = res
+            self.busy = False
+            self.btn_refresh.configure(state="normal")
+            self.btn_cancel.configure(state="disabled")
+            self.pb.configure(value=100 if ok_n else 0)
+            self._set_status(
+                f"部分迁移完成：成功 {ok_n} 个子目录，跳过 {fail_n} 个，释放 {human(freed)}")
+            self._log(f"===== 部分迁移结束：成功 {ok_n} / 跳过 {fail_n}，"
+                      f"释放 {human(freed)} =====")
+            self.refresh()
+            self.app.on_targets_updated()
+            if ok_n:
+                tip = f"成功迁移 {ok_n} 个子目录，C 盘释放约 {human(freed)}。"
+                if fail_n:
+                    tip += (f"\n\n另有 {fail_n} 个被占用、已跳过，"
+                            "需要先关闭相关程序再单独迁移。")
+                messagebox.showinfo("部分迁移完成", tip)
+            else:
+                messagebox.showwarning(
+                    "没有迁移成功",
+                    "所有子目录都被占用了。请关闭正在使用这个目录的程序后，"
+                    "再重新尝试完整迁移。")
+
+        run_async(self.app.post, work, done,
+                  on_error=lambda e: (self._log(f"异常：{e}"), self._reset()))
 
     def _retry_when_idle(self, targets, tries=0, note=""):
         """等扫描/刷新结束再重试，避免撞上 busy 直接退出。"""

@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 from cdisk import ui
-from cdisk.migrate import Job, is_lock_error, migrate_job
+from cdisk.migrate import Job, is_lock_error, list_subdirs, migrate_job, partial_migrate
 from cdisk.pages.analyze import AnalyzePage
 from cdisk.pages.clean_page import CleanPage
 from cdisk.pages.history import HistoryPage
@@ -294,12 +294,80 @@ class App:
                             "文件被占用",
                             f"{msg}\n\n要不要查找并关闭占用它的程序？\n"
                             "（关闭前请先保存工作，未保存的数据会丢失）"):
-                        show_unlock(self.root, self, [path],
-                                    on_retry=lambda note="": self.custom_migrate(path))
+                        show_unlock(
+                            self.root, self, [path],
+                            on_retry=lambda note="": self.custom_migrate(path),
+                            on_partial=lambda: self.partial_migrate_dir(path))
+                    elif messagebox.askyesno(
+                            "改为部分迁移？",
+                            "不关闭程序也可以：把这个目录下「没被占用」的子目录单独迁走。\n\n"
+                            "被正在运行的程序锁住的少数文件会自动跳过，"
+                            "其余部分照常搬到目标盘。\n\n要试试部分迁移吗？"):
+                        self.partial_migrate_dir(path)
                 else:
                     messagebox.showerror("迁移失败", msg)
 
         run_async(self.post, work, done, on_error=lambda e: self.set_status(f"失败：{e}"))
+
+    def partial_migrate_dir(self, path):
+        """把某个目录下没被占用的一级子目录逐个迁走。
+
+        正在运行的程序会锁住数据库和缓存，但同目录下的 traces / logs /
+        plugins 往往完全没被锁，单独迁走一样能腾出空间，且不用关任何程序。
+        """
+        subs = list_subdirs(path)
+        if not subs:
+            messagebox.showinfo(
+                "没有可拆分的子目录",
+                "这个目录下面没有可以单独迁移的子目录。\n"
+                "请关闭占用它的程序后重试完整迁移。")
+            return
+        dest = self.svc.dest_root
+        if not messagebox.askyesno(
+                "部分迁移",
+                f"将把这个目录下的 {len(subs)} 个子目录逐个尝试迁移，"
+                "被占用的会自动跳过。\n\n"
+                f"落点：{dest}\n\n"
+                "这个方式不需要关闭任何程序。是否继续？"):
+            return
+
+        self.set_status("正在部分迁移 …")
+        base = os.path.basename(path.rstrip("\\/"))
+
+        def stage(msg):
+            self.post(lambda: self.set_status(msg))
+
+        def prog(p):
+            self.post(lambda: self.set_status(f"部分迁移 {base} · {p*100:.0f}%"))
+
+        def on_item(i, total, name, st):
+            if st == "start":
+                self.post(lambda: self.set_status(f"({i}/{total}) 正在迁移 {name} …"))
+
+        def work():
+            return partial_migrate(path, dest, progress=prog, stage=stage,
+                                   keep_backup=self.svc.keep_backup,
+                                   on_item=on_item)
+
+        def done(res):
+            ok_n, fails, freed = res
+            self.set_status(
+                f"部分迁移完成：成功 {ok_n} 个，跳过 {len(fails)} 个，释放 {human(freed)}")
+            self.refresh_targets()
+            if ok_n:
+                tip = f"成功迁移 {ok_n} 个子目录，C 盘释放约 {human(freed)}。"
+                if fails:
+                    names = "、".join(os.path.basename(s) for s, _ in fails[:5])
+                    tip += (f"\n\n另有 {len(fails)} 个被占用、已跳过：\n{names}\n\n"
+                            "需要先关闭正在使用它们的程序，再单独迁移。")
+                messagebox.showinfo("部分迁移完成", tip)
+            else:
+                messagebox.showwarning(
+                    "没有迁移成功",
+                    "所有子目录都被占用了。请关闭正在使用这个目录的程序后重试。")
+
+        run_async(self.post, work, done,
+                  on_error=lambda e: self.set_status(f"部分迁移失败：{e}"))
 
 
 def _set_window_icon(root):

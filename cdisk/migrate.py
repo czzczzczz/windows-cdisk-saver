@@ -232,6 +232,73 @@ def migrate_job(job: Job, progress=None, stage=None, cancel=None,
     return True, f"完成，已释放 {job.bytes/1024/1024/1024:.2f} GB", rec
 
 
+def list_subdirs(src: str) -> list:
+    """列出可以单独迁移的一级子目录（跳过重解析点）。"""
+    out = []
+    try:
+        with os.scandir(src) as it:
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False) and not (
+                            e.stat(follow_symlinks=False).st_file_attributes & 0x400):
+                        out.append(e.path)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def partial_migrate(src_root: str, dest_root: str, progress=None, stage=None,
+                    cancel=None, keep_backup: bool = False, on_item=None):
+    """把 src_root 下能迁的一级子目录逐个迁走，被占用的跳过。
+
+    用途：整个目录因为「有几个文件被正在运行的程序锁住」而迁移失败时，
+    往往绝大部分子目录其实完全没被锁。把它们单独迁走一样能腾出空间，
+    而且不需要关掉任何程序。
+
+    返回 (成功数, 失败列表[(子目录, 原因)], 释放字节)。
+    """
+    base = os.path.basename(src_root.rstrip("\\/")) or "dir"
+    subs = list_subdirs(src_root)
+    total = len(subs)
+    ok_n, freed, fails = 0, 0, []
+
+    def notify(i, name, state):
+        if on_item:
+            try:
+                on_item(i, total, name, state)
+            except Exception:
+                pass
+
+    for i, sub in enumerate(subs, 1):
+        if cancel is not None and cancel.is_set():
+            break
+        name = os.path.basename(sub)
+        notify(i, name, "start")
+        dst = os.path.join(dest_root, "Custom", base, name)
+        job = Job(src=sub, dst=dst, tid="partial", name=f"{base}\\{name}")
+        try:
+            job.scan()
+        except OSError:
+            fails.append((sub, "无法读取目录"))
+            notify(i, name, "fail")
+            continue
+        if job.files == 0 and job.bytes == 0:
+            notify(i, name, "empty")
+            continue
+        good, msg, _rec = migrate_job(job, progress=progress, stage=stage,
+                                      cancel=cancel, keep_backup=keep_backup)
+        if good:
+            ok_n += 1
+            freed += job.bytes
+            notify(i, name, "ok")
+        else:
+            fails.append((sub, msg))
+            notify(i, name, "fail")
+    return ok_n, fails, freed
+
+
 def rollback(rec: dict, progress=None, stage=None) -> tuple:
     """把已迁移的目录搬回 C 盘并删除联接。"""
     def st(msg):

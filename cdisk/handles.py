@@ -160,33 +160,154 @@ def _still_alive(pid: int, start_time) -> bool:
         return True
 
 
-def _sample_files(root: str, limit: int = 320, max_walk: int = 6000) -> list:
-    """挑一批「最可能被占用」的文件：优先最近修改过的。"""
+GENERIC_READ = 0x80000000
+OPEN_EXISTING = 3
+FILE_ATTRIBUTE_NORMAL = 0x80
+ERROR_SHARING_VIOLATION = 32
+ERROR_LOCK_VIOLATION = 33
+
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_k32.CreateFileW.restype = ctypes.c_void_p
+INVALID_HANDLE = 0xFFFFFFFFFFFFFFFF
+
+
+def is_locked_file(path: str) -> bool:
+    """独占打开测试：能打开说明没被独占锁住。
+
+    这是判定「迁移会不会因为这个文件失败」最直接的办法——
+    robocopy 复制的正是这些打不开的文件。比让 Restart Manager
+    去猜哪批文件被占用准得多。
+    """
+    h = _k32.CreateFileW(path, GENERIC_READ, 0, None, OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL, None)
+    if not h or h == INVALID_HANDLE:
+        err = ctypes.get_last_error()
+        return err in (ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION)
+    _k32.CloseHandle(ctypes.c_void_p(h))
+    return False
+
+
+def _top_dirs(root: str) -> list:
+    """一级子目录（跳过重解析点）。"""
+    out = []
+    try:
+        with os.scandir(root) as it:
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False) and not (
+                            e.stat(follow_symlinks=False).st_file_attributes & 0x400):
+                        out.append(e.path)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def _files_in(d: str, want: int, max_entries: int = 4000):
+    """在单个目录树里取最近修改的 want 个文件（广度优先，条目数有上限）。"""
+    from collections import deque
     rows = []
     seen = 0
-    stack = [root]
-    while stack and seen < max_walk:
-        cur = stack.pop()
+    q = deque([d])
+    while q and seen < max_entries:
+        cur = q.popleft()
         try:
             with os.scandir(cur) as it:
                 for e in it:
                     seen += 1
-                    if seen >= max_walk:
+                    if seen >= max_entries:
                         break
                     try:
                         if e.is_dir(follow_symlinks=False):
                             if not (e.stat(follow_symlinks=False).st_file_attributes
-                                    & 0x400):  # 跳过重解析点
-                                stack.append(e.path)
+                                    & 0x400):
+                                q.append(e.path)
                         else:
-                            st = e.stat(follow_symlinks=False)
-                            rows.append((st.st_mtime, e.path))
+                            rows.append((e.stat(follow_symlinks=False).st_mtime, e.path))
                     except OSError:
                         continue
         except OSError:
             continue
     rows.sort(reverse=True)
-    return [p for _, p in rows[:limit]]
+    return [p for _, p in rows[:want]]
+
+
+def _sample_files(root: str, limit: int = 320, max_walk: int = 6000) -> list:
+    """挑一批「最可能被占用」的文件。
+
+    旧实现是深度优先 + 单一预算，遇到 binaries 这种两万多个文件的目录时
+    预算会被一个子目录吃光，根目录上的 workbuddy.db / lockfile 反而采不到。
+    现在改成：根目录下的文件全取，再给每个一级子目录分配配额，保证覆盖。
+    """
+    picked = []
+    try:
+        with os.scandir(root) as it:
+            for e in it:
+                try:
+                    if not e.is_dir(follow_symlinks=False):
+                        picked.append((e.stat(follow_symlinks=False).st_mtime, e.path))
+                except OSError:
+                    continue
+    except OSError:
+        return []
+
+    tops = _top_dirs(root)
+    if tops:
+        quota = max(12, min(60, limit // max(1, len(tops))))
+        for d in tops:
+            for p in _files_in(d, quota, max_entries=max(800, max_walk // max(1, len(tops)))):
+                picked.append((0.0, p))     # 已按 mtime 排好，权重置 0 保持稳定
+    picked.sort(key=lambda x: x[0], reverse=True)
+    out, seen = [], set()
+    for _, p in picked:
+        k = os.path.normcase(p)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(p)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def locked_files(root: str, limit: int = 120, budget: int = 1500) -> list:
+    """找出真正被独占锁住的文件，供 Restart Manager 精确定位占用进程。
+
+    只探有限个，保证耗时可控（实测 100 多个文件在 1 秒内）。
+    """
+    out = []
+    for p in _sample_files(root, limit=budget):
+        if is_locked_file(p):
+            out.append(p)
+            if len(out) >= limit:
+                break
+    return out
+
+
+
+def visible_pids() -> set:
+    """有可见窗口的进程。用来判断「这个进程用户是不是正在用」。"""
+    out = set()
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+        @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        def cb(hwnd, _):
+            try:
+                if user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd) > 0:
+                    pid = wt.DWORD(0)
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if pid.value:
+                        out.add(int(pid.value))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(cb, 0)
+    except Exception:
+        pass
+    return out
 
 
 def _ancestor_chain(pid: int, snap: dict, depth: int = 3) -> str:
@@ -206,11 +327,18 @@ def _ancestor_chain(pid: int, snap: dict, depth: int = 3) -> str:
     return " ← ".join(names) if names else "—"
 
 
-def using_processes(path: str, limit: int = 320) -> list:
-    """返回 [{pid, name, exe, type}]，可能为空（没占用 / 权限不足）。"""
+def using_processes(path: str, limit: int = 320, extra_files=None) -> list:
+    """返回 [{pid, name, exe, type}]，可能为空（没占用 / 权限不足）。
+
+    extra_files 用于传入「已经确认被独占锁住」的文件——把它们一起注册，
+    Restart Manager 才能精准定位到持有者，而不是在一堆没被锁的文件里瞎猜。
+    """
     if _rm is None or not os.path.exists(path):
         return []
-    files = _sample_files(path, limit=limit)
+    files = list(extra_files or [])
+    for p in _sample_files(path, limit=limit):
+        if p not in files:
+            files.append(p)
     if not files:
         return []
 
@@ -245,6 +373,7 @@ def using_processes(path: str, limit: int = 320) -> list:
         out = []
         me = os.getpid()
         snap = _snapshot()
+        win_pids = visible_pids()
         for i in range(min(count.value, n)):
             info = buf[i]
             pid = int(info.Process.dwProcessId)
@@ -263,6 +392,7 @@ def using_processes(path: str, limit: int = 320) -> list:
                 "type": RM_APP_TYPE.get(int(info.ApplicationType), "未知"),
                 "parent": _ancestor_chain(pid, snap),
                 "mem_kb": _mem_kb(pid),
+                "has_window": pid in win_pids,
             })
         # 去重
         seen, uniq = set(), []

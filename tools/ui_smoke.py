@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -262,10 +263,15 @@ def main():
             messagebox.showwarning = lambda t, m="", **k: popups.append(t) or "ok"
             messagebox.showinfo = lambda t, m="", **k: popups.append(t) or "ok"
 
-            def fake_use(p, limit=320):
+            def fake_use(p, limit=320, extra_files=None):
                 # 第一次（对话框打开）给占用列表；之后的重扫给 rescan
                 return list(VICTIM) if not fake_use.called else list(rescan)
             fake_use.called = False
+
+            # 不真的去独占探测整个 AppData\Local（慢且与本用例无关）
+            o_lk = UU.locked_files
+            UU.locked_files = lambda p, limit=120, budget=1500: []
+
 
             def fake_kill(pids):
                 fake_use.called = True
@@ -314,6 +320,7 @@ def main():
 
             finally:
                 UU.using_processes, UU.kill_processes = o_use, o_kill
+                UU.locked_files = o_lk
                 # 清干净：残留的 grab 会让下一个场景的事件循环卡死
                 for tw in list(root.winfo_children()):
                     if isinstance(tw, tk.Toplevel) and tw.title() == "关闭占用程序":
@@ -404,6 +411,87 @@ def main():
         check("kill_processes 拒绝结束自身", kill_self_guard)
 
         messagebox.showinfo, messagebox.showwarning = _info, _warn
+
+        print("\n[4e] 占用检测精度 + 部分迁移")
+        from cdisk.handles import _sample_files, is_locked_file
+        from cdisk.migrate import list_subdirs, partial_migrate
+        from cdisk.util import is_junction
+
+        def sample_covers_root():
+            """根目录下的文件必须被采样到——旧实现会被大子目录吃光预算。"""
+            tmp = os.path.join(os.environ["TEMP"], "_cdisk_sample_test")
+            shutil.rmtree(tmp, ignore_errors=True)
+            os.makedirs(tmp)
+            try:
+                key = os.path.join(tmp, "important.db")
+                open(key, "wb").write(b"x" * 100)
+                big = os.path.join(tmp, "bigdir")
+                os.makedirs(big)
+                for i in range(3000):
+                    open(os.path.join(big, f"f{i}.txt"), "wb").write(b"y")
+                got = {os.path.normcase(p) for p in _sample_files(tmp, limit=60)}
+                expect(os.path.normcase(key) in got,
+                       "根目录文件没被采样到（预算被 bigdir 吃光了）")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        check("采样必须覆盖根目录文件", sample_covers_root)
+
+        def lock_probe():
+            tmp = os.path.join(os.environ["TEMP"], "_cdisk_lock_test")
+            shutil.rmtree(tmp, ignore_errors=True)
+            os.makedirs(tmp)
+            try:
+                free = os.path.join(tmp, "free.txt")
+                open(free, "wb").write(b"x" * 100)
+                expect(not is_locked_file(free), "未锁文件被误判为被锁")
+                expect(is_locked_file(os.path.join(tmp, "_nope_xyz")) is False,
+                       "不存在的文件不该算作被锁")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        check("独占锁探测不误报", lock_probe)
+
+        def partial_case():
+            """三个子目录，中间一个被独占锁：可迁的迁走，被锁的原样保留。"""
+            base = os.path.join(os.environ["USERPROFILE"], "_cdisk_partial_smoke")
+            root = os.path.join(base, "data")
+            # 必须跨盘，否则 migrate_job 会拒绝
+            other = "D:" if os.path.splitdrive(
+                os.environ["USERPROFILE"])[0].upper() != "D:" else "C:"
+            dest = os.path.join(other + "\\", "_cdisk_partial_dst")
+            shutil.rmtree(base, ignore_errors=True)
+            shutil.rmtree(dest, ignore_errors=True)
+            try:
+                for name in ("aaa", "bbb", "ccc"):
+                    d = os.path.join(root, name)
+                    os.makedirs(d)
+                    for i in range(4):
+                        open(os.path.join(d, f"f{i}.bin"), "wb").write(b"Z" * 8000)
+
+                expect(len(list_subdirs(root)) == 3, "子目录枚举数量不对")
+
+                import ctypes
+                k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                k32.CreateFileW.restype = ctypes.c_void_p
+                locked = os.path.join(root, "bbb", "f0.bin")
+                h = k32.CreateFileW(locked, 0x80000000, 0, None, 3, 0x80, None)
+                expect(h and h != 0xFFFFFFFFFFFFFFFF, "无法造出独占占用")
+                try:
+                    expect(is_locked_file(locked), "独占占用没被探测出来")
+                    ok_n, fails, freed = partial_migrate(root, dest)
+                    expect(ok_n == 2, f"应该迁走 2 个，实际 {ok_n}")
+                    expect(len(fails) == 1, f"应该跳过 1 个，实际 {len(fails)}")
+                    expect(is_junction(os.path.join(root, "aaa")), "aaa 应已变成联接")
+                    expect(is_junction(os.path.join(root, "ccc")), "ccc 应已变成联接")
+                    expect(not is_junction(os.path.join(root, "bbb")),
+                           "bbb 被锁，不该被迁移")
+                    expect(len(os.listdir(os.path.join(root, "bbb"))) == 4,
+                           "bbb 的文件必须原样保留")
+                finally:
+                    k32.CloseHandle(ctypes.c_void_p(h))
+            finally:
+                shutil.rmtree(base, ignore_errors=True)
+                shutil.rmtree(dest, ignore_errors=True)
+        check("部分迁移：跳过被锁子目录，数据零损失", partial_case)
 
         print("\n[5] 系统清理页")
         cp = app.pages["clean_page"] if "clean_page" in app.pages else app.pages["clean"]

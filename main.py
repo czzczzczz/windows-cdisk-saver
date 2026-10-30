@@ -16,6 +16,7 @@ from cdisk.pages.history import HistoryPage
 from cdisk.pages.migrate_page import MigratePage
 from cdisk.pages.monitor_page import MonitorPage
 from cdisk.pages.overview import OverviewPage
+from cdisk.pages.unlock import show_unlock
 from cdisk.service import Service
 from cdisk.ui import (ACCENT, ACCENT_BG, ACCENT_DK, BG, BORDER, CARD, GREEN, MUTED,
                       ORANGE, SUB, TEXT, Dispatcher, label, run_async)
@@ -288,9 +289,28 @@ class App:
                 messagebox.showinfo("完成", msg)
                 self.refresh_targets()
             else:
-                messagebox.showerror("迁移失败", msg)
+                if "被占用" in msg:
+                    if messagebox.askyesno(
+                            "文件被占用",
+                            f"{msg}\n\n要不要查找并关闭占用它的程序？\n"
+                            "（关闭前请先保存工作，未保存的数据会丢失）"):
+                        show_unlock(self.root, self, [path],
+                                    on_retry=lambda: self.custom_migrate(path))
+                else:
+                    messagebox.showerror("迁移失败", msg)
 
         run_async(self.post, work, done, on_error=lambda e: self.set_status(f"失败：{e}"))
+
+
+def _set_window_icon(root):
+    """窗口/任务栏图标。打包后资源在 _MEIPASS，源码运行则取项目 assets。"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    ico = os.path.join(base, "assets", "app.ico")
+    try:
+        if os.path.exists(ico):
+            root.iconbitmap(default=ico)
+    except Exception:
+        pass
 
 
 def _install_error_hooks(root):
@@ -328,6 +348,7 @@ def main():
     except Exception:
         pass
     _install_error_hooks(root)
+    _set_window_icon(root)
     page = ""
     for a in sys.argv[1:]:
         if a.startswith("--page="):

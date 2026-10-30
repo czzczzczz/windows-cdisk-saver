@@ -12,6 +12,7 @@ from ..ui import (ACCENT, BG, BORDER, CARD, GREEN, MUTED, ORANGE, RED, SUB, TEXT
                   button, card, entry, label, run_async, tree, F_BODY, F_H1, F_SMALL,
                   F_TITLE)
 from ..util import human, is_admin
+from .unlock import show_unlock
 
 BOX_ON, BOX_OFF = "☑", "☐"
 
@@ -480,6 +481,7 @@ class MigratePage(tk.Frame):
 
         def work():
             ok_cnt, fail_cnt, freed = 0, 0, 0
+            locked = []
             total = len(targets)
             for idx, t in enumerate(targets, 1):
                 if self.cancel.is_set():
@@ -506,11 +508,13 @@ class MigratePage(tk.Frame):
                         self.app.post(lambda m=msg: self._log(f"  ✔ {m}"))
                     else:
                         fail_cnt += 1
+                        if "被占用" in msg:
+                            locked.append(t)
                         self.app.post(lambda m=msg: self._log(f"  ✘ {m}"))
-            return ok_cnt, fail_cnt, freed
+            return ok_cnt, fail_cnt, freed, locked
 
         def done(res):
-            ok_cnt, fail_cnt, freed = res
+            ok_cnt, fail_cnt, freed, locked = res
             self.busy = False
             self.btn_refresh.configure(state="normal")
             self.btn_all.configure(state="normal")
@@ -524,8 +528,33 @@ class MigratePage(tk.Frame):
             self.refresh()
             self.app.on_targets_updated()
 
+            if locked:
+                self.after(400, lambda: self._offer_unlock(locked))
+
         run_async(self.app.post, work, done,
                   on_error=lambda e: (self._log(f"异常：{e}"), self._reset()))
+
+    def _offer_unlock(self, targets):
+        """迁移因占用失败时，提供一键关闭占用程序并重试。"""
+        names = "、".join(t.name for t in targets[:5])
+        if not messagebox.askyesno(
+                "有程序正在占用文件",
+                f"以下 {len(targets)} 项因为文件被占用而没能迁移：\n{names}\n\n"
+                "要不要查找并关闭占用这些目录的程序？\n"
+                "（关闭前请先保存工作，未保存的数据会丢失）"):
+            return
+        paths = []
+        for t in targets:
+            paths.extend(t.expand())
+        show_unlock(self, self.app, paths,
+                    on_retry=lambda: self._retry_when_idle(targets))
+
+    def _retry_when_idle(self, targets, tries=0):
+        """等扫描/刷新结束再重试，避免撞上 busy 直接退出。"""
+        if self.busy and tries < 60:
+            self.after(500, lambda: self._retry_when_idle(targets, tries + 1))
+            return
+        self.migrate_targets(targets)
 
     def _reset(self):
         self.busy = False

@@ -196,6 +196,27 @@ def main():
         check("风险分级：普通目录=谨慎",
               lambda: expect(_risk(r"C:\x\AppData\Roaming\Tencent") == "caution", "应为 caution"))
 
+        print("\n[4c] 占用检测与「关闭占用」对话框")
+        from cdisk.handles import is_protected, using_processes
+        from cdisk.pages.unlock import show_unlock
+
+        check("using_processes 对不存在的路径返回空",
+              lambda: expect(using_processes(os.path.join(HOME, "_no_such_dir_xyz")) == [],
+                             "不存在的目录应返回空列表"))
+        check("系统关键进程受保护",
+              lambda: expect(is_protected("explorer.exe") and is_protected("lsass.exe"),
+                             "explorer/lsass 应受保护"))
+        check("普通程序不受保护",
+              lambda: expect(not is_protected("WeChat.exe"), "WeChat 不该受保护"))
+
+        def unlock_dlg():
+            w = show_unlock(root, app, [os.path.join(HOME, "AppData", "Local")], None)
+            root.update()
+            assert w.winfo_exists(), "对话框没创建出来"
+            w.grab_release()
+            w.destroy()
+        check("unlock 对话框 打开/关闭", unlock_dlg)
+
         print("\n[5] 系统清理页")
         cp = app.pages["clean_page"] if "clean_page" in app.pages else app.pages["clean"]
         app.open_page("clean")

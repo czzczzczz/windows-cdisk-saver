@@ -83,6 +83,62 @@ def capture(x, y, w, h, out, max_w=1400):
     return ow, oh
 
 
+def _encode(bits, w, h, out, max_w=1400):
+    step = max(1, w // max_w) if w > max_w else 1
+    ow, oh = w // step, h // step
+    px = bits
+    raw = bytearray()
+    for row in range(oh):
+        src = row * step * w * 4
+        raw.append(0)
+        for col in range(ow):
+            o = src + col * step * 4
+            raw += bytes((px[o + 2], px[o + 1], px[o]))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", ow, oh, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    png += chunk(b"IEND", b"")
+    with open(out, "wb") as f:
+        f.write(png)
+    return ow, oh
+
+
+def capture_window(hwnd, out, max_w=1400):
+    """用 PrintWindow 直接渲染窗口内容，不受其他窗口遮挡影响。"""
+    r = wt.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    w, h = r.right - r.left, r.bottom - r.top
+    if w <= 0 or h <= 0:
+        raise ValueError("窗口尺寸无效")
+
+    hdc = user32.GetWindowDC(hwnd)
+    mem = gdi32.CreateCompatibleDC(hdc)
+    bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+    gdi32.SelectObject(mem, bmp)
+    # PW_RENDERFULLCONTENT = 2，能抓到 DirectComposition 内容
+    user32.PrintWindow(hwnd, mem, 2)
+
+    bi = BITMAPINFOHEADER()
+    bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bi.biWidth = w
+    bi.biHeight = -h
+    bi.biPlanes = 1
+    bi.biBitCount = 32
+    bi.biCompression = 0
+    buf = ctypes.create_string_buffer(w * h * 4)
+    gdi32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bi), 0)
+
+    gdi32.DeleteObject(bmp)
+    gdi32.DeleteDC(mem)
+    user32.ReleaseDC(hwnd, hdc)
+    return _encode(buf.raw, w, h, out, max_w)
+
+
 if __name__ == "__main__":
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)

@@ -11,6 +11,21 @@ if not exist "%APP%" (
     exit /b 1
 )
 
+rem ============================================================
+rem  默认以管理员身份启动
+rem  处理 ProgramData / Windows 下的目录需要管理员权限，
+rem  目录联接本身不需要。想用普通权限调试：启动.bat /noadmin
+rem ============================================================
+if /i "%~1"=="/noadmin" goto findpy
+
+net session >nul 2>&1
+if errorlevel 1 (
+    echo 正在申请管理员权限 ...
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b
+)
+
+:findpy
 set "FOUND="
 
 rem ---- 1. 固定候选路径 ----

@@ -37,10 +37,12 @@ if errorlevel 1 (
     if errorlevel 1 goto err
 )
 
-echo [3/3] 开始打包 ...
+echo [3/3] 开始打包（内嵌管理员清单，双击即申请提权）...
 "!PY!" -m PyInstaller --noconfirm --clean --onefile --noconsole ^
+    --uac-admin ^
     --name "C盘空间管家" ^
     --icon "assets\app.ico" ^
+    --add-data "assets\app.ico;assets" ^
     --add-data "README.md;." ^
     main.py
 if errorlevel 1 goto err

@@ -161,6 +161,11 @@ def migrate_job(job: Job, progress=None, stage=None, cancel=None,
         os.rename(src, bak)
     except OSError as exc:
         _delete_tree(dst)
+        if getattr(exc, "winerror", None) == 5:
+            return (False,
+                    "源目录被占用或权限不足（WinError 5）：有程序正在使用其中的文件，"
+                    "或当前账户无权修改该目录。请关闭相关程序，或以管理员身份运行后重试。",
+                    None)
         return False, f"源目录被占用，请先关闭相关程序：{exc}", None
 
     if not make_junction(src, dst):

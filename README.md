@@ -104,6 +104,16 @@ C:\Users\<你>\AppData\Local\Microsoft\Edge\User Data\Default\Cache
 > 排除这几类是因为：把「已安装的程序」当缓存搬走会直接搞坏软件，把「桌面」当缓存搬走更离谱。
 > **宁可少报，不可误报。**
 
+## 一键关闭占用
+
+迁移最常失败的原因是**文件被程序占用**——微信开着、Edge 开着、VS Code 开着。
+这时工具会先回退（你的数据一个字节都不动），然后主动问你要不要处理：
+
+![关闭占用](docs/unlock.png)
+
+它用 Windows Restart Manager 找出到底是谁占着这些文件，列出程序名、PID、路径，
+勾选后一键结束并自动重试迁移。系统关键进程（explorer、lsass 等）会被置灰，勾不上。
+
 ## 快速开始
 
 ### 方式一：直接运行（推荐）
@@ -112,11 +122,16 @@ C:\Users\<你>\AppData\Local\Microsoft\Edge\User Data\Default\Cache
 双击 启动.bat
 ```
 
+**默认申请管理员权限**（处理 `ProgramData`、`Windows` 下的目录需要）。
+如果 UAC 被拒绝，脚本会以普通权限继续运行，只是系统级目录迁不了。
+
 会自动挑一个**带 tkinter 的** Python 解释器（项目内 `.venv` → 各版本安装目录 → PATH），
 逐个跑 `import tkinter` 检测，不带 tkinter 的直接跳过。
 
 > 为什么要检测？精简版、内嵌版、部分工具自带的 Python 不含 tkinter，
 > 直接用会报 `ModuleNotFoundError`，而 `pythonw` 无控制台，窗口一闪就没，看不到错误。
+
+想用普通权限调试：`启动.bat /noadmin`
 
 ### 出问题就双击 `诊断.bat`
 
@@ -134,7 +149,7 @@ python main.py
 build.bat
 ```
 
-产物：`dist\C盘空间管家.exe`（约 11 MB，无控制台窗口）
+产物：`dist\C盘空间管家.exe`（约 11 MB，无控制台窗口，**内嵌管理员清单，双击即申请提权**）
 
 ### 自检
 
@@ -167,11 +182,12 @@ python tools\ui_smoke.py    :: 界面：所有页面回调逐个触发
 ## 常见问题
 
 **Q：迁移时提示「源目录被占用」？**
-对应软件还在运行。完全退出它（托盘也要退）再试。不会损坏数据。
+对应软件还在运行。工具会弹窗列出占用进程，勾选后可以一键结束并自动重试。
+不想结束进程，就手动退出软件再迁。**源目录此时完好无损**，只是没搬成。
 
 **Q：需要管理员权限吗？**
-目录联接本身不需要。但 `ProgramData`、`Windows` 下的目录需要管理员才能读写，
-处理这些时请右键「以管理员身份运行」。
+启动脚本和 exe 都会默认申请管理员权限——`ProgramData`、`Windows` 下的目录需要它。
+目录联接本身不需要管理员，所以 UAC 被拒也能正常迁移用户目录。
 
 **Q：会不会影响软件更新？**
 一般不会。极少数软件升级时会重建数据目录，此时联接可能被覆盖，
@@ -198,12 +214,13 @@ CDiskSaver/
 │  ├─ targets.py           33 个内置迁移目标 + 检测规则
 │  ├─ discover.py          智能发现：找出内置库之外的大目录
 │  ├─ migrate.py           迁移引擎、回退、台账
+│  ├─ handles.py           占用检测（Restart Manager）+ 结束进程
 │  ├─ scan.py              目录体积树 + 大文件排行
 │  ├─ watch.py             ReadDirectoryChangesW 监听 + 快照对比
 │  ├─ clean.py             系统垃圾清理项
 │  ├─ service.py           配置与扫描结果缓存
 │  ├─ ui.py                主题与控件
-│  └─ pages/               六个页面
+│  └─ pages/               六个页面 + 关闭占用对话框
 ├─ assets/                 图标
 └─ tools/                  截图、图标生成、界面冒烟测试
 ```
